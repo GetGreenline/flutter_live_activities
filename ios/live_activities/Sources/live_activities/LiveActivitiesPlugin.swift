@@ -417,6 +417,15 @@ public class LiveActivitiesPlugin: NSObject, FlutterPlugin, FlutterStreamHandler
         }
     }
     
+    /// Returns the attributes UUID for an ActivityKit activity identifier.
+    /// Keeps native lookups on the same attributes type as the plugin's observers.
+    @available(iOS 16.1, *)
+    @MainActor public static func activityAttributesId(for activityId: String) -> String? {
+        Activity<LiveActivitiesAppAttributes>.activities
+            .first { $0.id == activityId }?
+            .attributes.id.uuidString
+    }
+
     @available(iOS 16.1, *)
     func getPushToken(activityId: String, result: @escaping FlutterResult) {
         Task {
