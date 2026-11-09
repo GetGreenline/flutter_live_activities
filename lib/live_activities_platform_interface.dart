@@ -120,6 +120,12 @@ abstract class LiveActivitiesPlatform extends PlatformInterface {
     throw UnimplementedError('getPushToken() has not been implemented.');
   }
 
+  Future<void> restartActivityObservers() {
+    throw UnimplementedError(
+      'restartActivityObservers() has not been implemented.',
+    );
+  }
+
   Stream<ActivityUpdate> get activityUpdateStream =>
       throw UnimplementedError('pushTokenUpdates has not been implemented');
 

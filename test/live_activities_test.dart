@@ -85,6 +85,9 @@ class MockLiveActivitiesPlatform
   }
 
   @override
+  Future<void> restartActivityObservers() async {}
+
+  @override
   Stream<ActivityUpdate> get activityUpdateStream {
     final map = <String, dynamic>{
       'status': 'active',

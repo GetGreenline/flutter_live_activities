@@ -34,9 +34,10 @@ public class LiveActivitiesPlugin: NSObject, FlutterPlugin, FlutterStreamHandler
     private var scheduledDismissalActivities: [String: Any] = [:]
     private var activityEventSink: FlutterEventSink?
     private var pushToStartTokenEventSink: FlutterEventSink?
-    @MainActor private var monitoredActivityIds = Set<String>()
-    @MainActor private var tokenObservedActivityIds = Set<String>()
-    @MainActor private var observingActivityLifecycle = false
+    @MainActor private var activityUpdatesTask: Task<Void, Never>?
+    @MainActor private var pushToStartTokenTask: Task<Void, Never>?
+    @MainActor private var activityStateTasks: [String: Task<Void, Never>] = [:]
+    @MainActor private var activityTokenTasks: [String: Task<Void, Never>] = [:]
     
     public static func register(with registrar: FlutterPluginRegistrar) {
         let channel = FlutterMethodChannel(name: "live_activities", binaryMessenger: registrar.messenger())
@@ -55,21 +56,29 @@ public class LiveActivitiesPlugin: NSObject, FlutterPlugin, FlutterStreamHandler
     }
     
     public func detachFromEngine(for registrar: FlutterPluginRegistrar) {
-        urlSchemeSink = nil
-        activityEventSink = nil
-        pushToStartTokenEventSink = nil
+        MainActor.assumeIsolated {
+            urlSchemeSink = nil
+            activityEventSink = nil
+            pushToStartTokenEventSink = nil
+            stopObservingActivities()
+            stopObservingPushToStartTokens()
+        }
     }
     
     public func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
-        if let args = arguments as? String{
-            if (args == "urlSchemeStream") {
+        // The event channels use Flutter's default platform thread.
+        MainActor.assumeIsolated {
+            switch arguments as? String {
+            case "urlSchemeStream":
                 urlSchemeSink = events
-            } else if (args == "activityUpdateStream") {
+            case "activityUpdateStream":
                 activityEventSink = events
                 startObservingActivities()
-            } else if (args == "pushToStartTokenUpdateStream") {
+            case "pushToStartTokenUpdateStream":
                 pushToStartTokenEventSink = events
                 startObservingPushToStartTokens()
+            default:
+                break
             }
         }
         
@@ -77,13 +86,18 @@ public class LiveActivitiesPlugin: NSObject, FlutterPlugin, FlutterStreamHandler
     }
     
     public func onCancel(withArguments arguments: Any?) -> FlutterError? {
-        if let args = arguments as? String{
-            if (args == "urlSchemeStream") {
+        MainActor.assumeIsolated {
+            switch arguments as? String {
+            case "urlSchemeStream":
                 urlSchemeSink = nil
-            } else if (args == "activityUpdateStream") {
+            case "activityUpdateStream":
                 activityEventSink = nil
-            } else if (args == "pushToStartTokenUpdateStream") {
+                stopObservingActivities()
+            case "pushToStartTokenUpdateStream":
                 pushToStartTokenEventSink = nil
+                stopObservingPushToStartTokens()
+            default:
+                break
             }
         }
         return nil
@@ -98,6 +112,21 @@ public class LiveActivitiesPlugin: NSObject, FlutterPlugin, FlutterStreamHandler
     }
     
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+        if call.method == "restartActivityObservers" {
+            MainActor.assumeIsolated {
+                stopObservingActivities()
+                stopObservingPushToStartTokens()
+                if activityEventSink != nil {
+                    startObservingActivities()
+                }
+                if pushToStartTokenEventSink != nil {
+                    startObservingPushToStartTokens()
+                }
+                result(nil)
+            }
+            return
+        }
+
         if (call.method == "areActivitiesSupported") {
             guard #available(iOS 16.1, *), !ProcessInfo.processInfo.isiOSAppOnMac else {
                 result(false)
@@ -486,55 +515,54 @@ public class LiveActivitiesPlugin: NSObject, FlutterPlugin, FlutterStreamHandler
         }
     }
     
-    private func startObservingPushToStartTokens() {
-        if #available(iOS 17.2, *) {
-            Task {
-                for await data in Activity<LiveActivitiesAppAttributes>.pushToStartTokenUpdates {
-                    let token = data.map { String(format: "%02x", $0) }.joined()
-                    
-                    DispatchQueue.main.async {
-                        self.pushToStartTokenEventSink?(token)
-                    }
+    @MainActor private func startObservingPushToStartTokens() {
+        guard #available(iOS 17.2, *), pushToStartTokenTask == nil else { return }
+        pushToStartTokenTask = Task { [weak self] in
+            defer {
+                if !Task.isCancelled { self?.pushToStartTokenTask = nil }
+            }
+            for await data in Activity<LiveActivitiesAppAttributes>.pushToStartTokenUpdates {
+                guard let self, !Task.isCancelled else { return }
+                let token = data.map { String(format: "%02x", $0) }.joined()
+                self.pushToStartTokenEventSink?(token)
+            }
+        }
+    }
+
+    @MainActor private func stopObservingPushToStartTokens() {
+        pushToStartTokenTask?.cancel()
+        pushToStartTokenTask = nil
+    }
+
+    @MainActor private func startObservingActivities() {
+        guard #available(iOS 16.1, *) else {
+            return
+        }
+
+        for activity in Activity<LiveActivitiesAppAttributes>.activities {
+            attachObserversIfNeeded(activity)
+        }
+
+        if #available(iOS 17.2, *), activityUpdatesTask == nil {
+            activityUpdatesTask = Task { [weak self] in
+                defer {
+                    if !Task.isCancelled { self?.activityUpdatesTask = nil }
+                }
+                for await activity in Activity<LiveActivitiesAppAttributes>.activityUpdates {
+                    guard let self, !Task.isCancelled else { return }
+                    self.attachObserversIfNeeded(activity)
                 }
             }
         }
     }
 
-    private func startObservingActivities() {
-        guard #available(iOS 16.1, *) else {
-            return
-        }
-
-        Task {
-            let existingActivities = await MainActor.run { Activity<LiveActivitiesAppAttributes>.activities }
-            await MainActor.run {
-                for activity in existingActivities {
-                    self.attachObserversIfNeeded(activity)
-                }
-            }
-        }
-
-        if #available(iOS 17.2, *) {
-            Task {
-                let shouldStart = await MainActor.run { () -> Bool in
-                    if self.observingActivityLifecycle {
-                        return false
-                    }
-                    self.observingActivityLifecycle = true
-                    return true
-                }
-
-                guard shouldStart else {
-                    return
-                }
-
-                for await activity in Activity<LiveActivitiesAppAttributes>.activityUpdates {
-                    await MainActor.run {
-                        self.attachObserversIfNeeded(activity)
-                    }
-                }
-            }
-        }
+    @MainActor private func stopObservingActivities() {
+        activityUpdatesTask?.cancel()
+        activityUpdatesTask = nil
+        activityStateTasks.values.forEach { $0.cancel() }
+        activityStateTasks.removeAll()
+        activityTokenTasks.values.forEach { $0.cancel() }
+        activityTokenTasks.removeAll()
     }
     
     @available(iOS 16.1, *)
@@ -674,97 +702,67 @@ public class LiveActivitiesPlugin: NSObject, FlutterPlugin, FlutterStreamHandler
     }
     
     @available(iOS 16.1, *)
-    private func monitorLiveActivity<T : ActivityAttributes>(_ activity: Activity<T>) {
-        Task {
+    @MainActor private func monitorLiveActivity<T: ActivityAttributes>(_ activity: Activity<T>) {
+        guard activityStateTasks[activity.id] == nil else { return }
+        activityStateTasks[activity.id] = Task { [weak self] in
+            defer {
+                if !Task.isCancelled { self?.activityStateTasks.removeValue(forKey: activity.id) }
+            }
             for await state in activity.activityStateUpdates {
+                guard let self, !Task.isCancelled else { return }
                 switch state {
                 case .active:
-                    await MainActor.run {
-                        self.attachTokenObserverIfNeeded(activity)
-                    }
+                    self.attachTokenObserverIfNeeded(activity)
                 case .dismissed, .ended:
-                    DispatchQueue.main.async {
-                        var response: Dictionary<String, Any> = Dictionary()
-                        response["activityId"] = activity.id
-                        response["status"] = "ended"
-                        self.activityEventSink?.self(response)
-                    }
+                    self.activityTokenTasks.removeValue(forKey: activity.id)?.cancel()
+                    self.activityEventSink?(["activityId": activity.id, "status": "ended"])
+                    return
                 case .stale:
-                    DispatchQueue.main.async {
-                        var response: Dictionary<String, Any> = Dictionary()
-                        response["activityId"] = activity.id
-                        response["status"] = "stale"
-                        self.activityEventSink?.self(response)
-                    }
+                    self.activityEventSink?(["activityId": activity.id, "status": "stale"])
                 @unknown default:
-                    DispatchQueue.main.async {
-                        var response: Dictionary<String, Any> = Dictionary()
-                        response["activityId"] = activity.id
-                        response["status"] = "unknown"
-                        self.activityEventSink?.self(response)
-                    }
+                    self.activityEventSink?(["activityId": activity.id, "status": "unknown"])
                 }
             }
         }
     }
     
     @available(iOS 16.1, *)
-    private func monitorTokenChanges<T: ActivityAttributes>(_ activity: Activity<T>) {
-        Task {
-            for await data in activity.pushTokenUpdates {
-                DispatchQueue.main.async {
-                    var response: Dictionary<String, Any> = Dictionary()
-                    let pushToken = data.map {String(format: "%02x", $0)}.joined()
-                    response["token"] = pushToken
-                    response["activityId"] = activity.id
-                    response["status"] = "active"
-                    self.activityEventSink?.self(response)
-                }
-            }
-        }
-    }
-
-    @available(iOS 16.1, *)
     @MainActor private func attachObserversIfNeeded(_ activity: Activity<LiveActivitiesAppAttributes>) {
-        if !monitoredActivityIds.contains(activity.id) {
-            monitoredActivityIds.insert(activity.id)
-            monitorLiveActivity(activity)
-        }
-
-        if activity.activityState == .active {
+        guard activityEventSink != nil else { return }
+        monitorLiveActivity(activity)
+        switch activity.activityState {
+        case .active, .stale:
             attachTokenObserverIfNeeded(activity)
+        default:
+            break
         }
     }
 
     @available(iOS 16.1, *)
     @MainActor private func attachTokenObserverIfNeeded<T: ActivityAttributes>(_ activity: Activity<T>) {
-        if tokenObservedActivityIds.contains(activity.id) {
-            return
+        guard activityTokenTasks[activity.id] == nil else { return }
+        activityTokenTasks[activity.id] = Task { [weak self] in
+            defer {
+                if !Task.isCancelled { self?.activityTokenTasks.removeValue(forKey: activity.id) }
+            }
+            guard !Task.isCancelled else { return }
+            var lastToken = activity.pushToken
+            if let lastToken {
+                self?.emitActivityToken(lastToken, activityId: activity.id)
+            }
+            for await token in activity.pushTokenUpdates {
+                guard let self, !Task.isCancelled else { return }
+                if token == lastToken { continue }
+                lastToken = token
+                self.emitActivityToken(token, activityId: activity.id)
+            }
         }
-
-        tokenObservedActivityIds.insert(activity.id)
-        emitCurrentTokenIfPresent(activity)
-        monitorTokenChanges(activity)
     }
 
-    @available(iOS 16.1, *)
-    private func emitCurrentTokenIfPresent<T: ActivityAttributes>(_ activity: Activity<T>) {
-        guard let data = activity.pushToken else {
-            return
-        }
-
-        let pushToken = data.map { String(format: "%02x", $0) }.joined()
-        guard !pushToken.isEmpty else {
-            return
-        }
-
-        DispatchQueue.main.async {
-            var response: Dictionary<String, Any> = Dictionary()
-            response["token"] = pushToken
-            response["activityId"] = activity.id
-            response["status"] = "active"
-            self.activityEventSink?.self(response)
-        }
+    @MainActor private func emitActivityToken(_ data: Data, activityId: String) {
+        guard !data.isEmpty else { return }
+        let token = data.map { String(format: "%02x", $0) }.joined()
+        activityEventSink?(["token": token, "activityId": activityId, "status": "active"])
     }
     
     @available(iOS 16.1, *)

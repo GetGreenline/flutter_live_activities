@@ -174,6 +174,12 @@ class LiveActivities {
     return LiveActivitiesPlatform.instance.getPushToken(activityId);
   }
 
+  /// Restarts the native iOS activity and push token observers.
+  /// Existing Dart stream subscriptions remain active.
+  Future<void> restartActivityObservers() {
+    return LiveActivitiesPlatform.instance.restartActivityObservers();
+  }
+
   /// Get all iOS 16.1+ live activity ids.
   /// You can get an activity id by calling [createActivity].
   Future<List<String>> getAllActivitiesIds() {

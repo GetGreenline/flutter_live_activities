@@ -215,6 +215,12 @@ class MethodChannelLiveActivities extends LiveActivitiesPlatform {
   }
 
   @override
+  Future<void> restartActivityObservers() async {
+    if (defaultTargetPlatform != TargetPlatform.iOS) return;
+    await methodChannel.invokeMethod<void>('restartActivityObservers');
+  }
+
+  @override
   Stream<ActivityUpdate> get activityUpdateStream {
     if (defaultTargetPlatform != TargetPlatform.iOS) {
       return Stream.empty();
