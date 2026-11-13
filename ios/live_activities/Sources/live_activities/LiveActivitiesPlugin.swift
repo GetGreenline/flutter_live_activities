@@ -38,6 +38,10 @@ public class LiveActivitiesPlugin: NSObject, FlutterPlugin, FlutterStreamHandler
     @MainActor private var pushToStartTokenTask: Task<Void, Never>?
     @MainActor private var activityStateTasks: [String: Task<Void, Never>] = [:]
     @MainActor private var activityTokenTasks: [String: Task<Void, Never>] = [:]
+    // activityUpdates can deliver an activity before Activity.activities contains
+    // it. Keep that instance for lookups and observer restarts (iOS 13 type erasure).
+    @MainActor private static var observedActivities: [String: Any] = [:]
+    @MainActor private var observedActivityTokens: [String: Data] = [:]
     
     public static func register(with registrar: FlutterPluginRegistrar) {
         let channel = FlutterMethodChannel(name: "live_activities", binaryMessenger: registrar.messenger())
@@ -366,7 +370,7 @@ public class LiveActivitiesPlugin: NSObject, FlutterPlugin, FlutterStreamHandler
                 return
             }
 
-            let activities = await MainActor.run { Activity<LiveActivitiesAppAttributes>.activities }
+            let activities = await MainActor.run { Self.knownActivities() }
             guard let activity = activities.first(where: { $0.id == activityId }) else {
                 result(FlutterError(code: "ACTIVITY_ERROR", message: "Activity not found", details: nil))
                 return
@@ -407,7 +411,7 @@ public class LiveActivitiesPlugin: NSObject, FlutterPlugin, FlutterStreamHandler
             
             var activities: [Activity<LiveActivitiesAppAttributes>] = []
             for _ in 0..<3 { // Try up to 3 times
-                activities = await MainActor.run { Activity<LiveActivitiesAppAttributes>.activities }
+                activities = await MainActor.run { Self.knownActivities() }
                 if !activities.isEmpty {
                     break
                 }
@@ -428,9 +432,9 @@ public class LiveActivitiesPlugin: NSObject, FlutterPlugin, FlutterStreamHandler
     
     @available(iOS 16.1, *)
     func getActivityState(activityId: String, result: @escaping FlutterResult) {
-        Task {
+        Task { @MainActor in
             let customId = uuid5(name: activityId)
-            let matchingActivity = Activity<LiveActivitiesAppAttributes>.activities.first {
+            let matchingActivity = Self.knownActivities().first {
                 $0.id == activityId ||
                 $0.attributes.id == customId ||
                 $0.attributes.id.uuidString.uppercased() == activityId.uppercased()
@@ -450,23 +454,35 @@ public class LiveActivitiesPlugin: NSObject, FlutterPlugin, FlutterStreamHandler
     /// Keeps native lookups on the same attributes type as the plugin's observers.
     @available(iOS 16.1, *)
     @MainActor public static func activityAttributesId(for activityId: String) -> String? {
-        Activity<LiveActivitiesAppAttributes>.activities
+        knownActivities()
             .first { $0.id == activityId }?
             .attributes.id.uuidString
     }
 
     @available(iOS 16.1, *)
-    func getPushToken(activityId: String, result: @escaping FlutterResult) {
-        Task {
-            var pushToken: String?;
-            for activity in Activity<LiveActivitiesAppAttributes>.activities {
-                if (activityId == activity.id) {
-                    if let data = activity.pushToken {
-                        pushToken = data.map { String(format: "%02x", $0) }.joined()
-                    }
-                }
+    @MainActor private static func knownActivities() -> [Activity<LiveActivitiesAppAttributes>] {
+        var activities = Dictionary(
+            Activity<LiveActivitiesAppAttributes>.activities.map { ($0.id, $0) },
+            uniquingKeysWith: { _, latest in latest }
+        )
+        for (id, value) in observedActivities {
+            if let activity = value as? Activity<LiveActivitiesAppAttributes> {
+                activities[id] = activity
             }
-            result(pushToken)
+        }
+        return Array(activities.values)
+    }
+
+    @available(iOS 16.1, *)
+    func getPushToken(activityId: String, result: @escaping FlutterResult) {
+        Task { @MainActor in
+            guard let activity = Self.knownActivities().first(where: { $0.id == activityId }),
+                  activity.activityState != .ended && activity.activityState != .dismissed else {
+                result(nil)
+                return
+            }
+            let data = activity.pushToken ?? observedActivityTokens[activityId]
+            result(data?.map { String(format: "%02x", $0) }.joined())
         }
     }
     
@@ -539,7 +555,7 @@ public class LiveActivitiesPlugin: NSObject, FlutterPlugin, FlutterStreamHandler
             return
         }
 
-        for activity in Activity<LiveActivitiesAppAttributes>.activities {
+        for activity in Self.knownActivities() {
             attachObserversIfNeeded(activity)
         }
 
@@ -567,22 +583,20 @@ public class LiveActivitiesPlugin: NSObject, FlutterPlugin, FlutterStreamHandler
     
     @available(iOS 16.1, *)
     func getAllActivitiesIds(result: @escaping FlutterResult) {
-        var activitiesId: [String] = []
-        for activity in Activity<LiveActivitiesAppAttributes>.activities {
-            activitiesId.append(activity.id)
+        MainActor.assumeIsolated {
+            result(Self.knownActivities().map { $0.id })
         }
-        
-        result(activitiesId)
     }
     
     @available(iOS 16.1, *)
     func getAllActivities(result: @escaping FlutterResult) {
-        var activitiesState: [String: String] = [:] // Corrected here
-        for activity in Activity<LiveActivitiesAppAttributes>.activities {
-            activitiesState[activity.id] = activityStateToString(activityState: activity.activityState)
+        MainActor.assumeIsolated {
+            var activitiesState: [String: String] = [:]
+            for activity in Self.knownActivities() {
+                activitiesState[activity.id] = activityStateToString(activityState: activity.activityState)
+            }
+            result(activitiesState)
         }
-        
-        result(activitiesState)
     }
     
     @available(iOS 16.1, *)
@@ -714,8 +728,7 @@ public class LiveActivitiesPlugin: NSObject, FlutterPlugin, FlutterStreamHandler
                 case .active:
                     self.attachTokenObserverIfNeeded(activity)
                 case .dismissed, .ended:
-                    self.activityTokenTasks.removeValue(forKey: activity.id)?.cancel()
-                    self.activityEventSink?(["activityId": activity.id, "status": "ended"])
+                    self.handleActivityEnded(activityId: activity.id)
                     return
                 case .stale:
                     self.activityEventSink?(["activityId": activity.id, "status": "stale"])
@@ -728,7 +741,12 @@ public class LiveActivitiesPlugin: NSObject, FlutterPlugin, FlutterStreamHandler
     
     @available(iOS 16.1, *)
     @MainActor private func attachObserversIfNeeded(_ activity: Activity<LiveActivitiesAppAttributes>) {
+        Self.observedActivities[activity.id] = activity
         guard activityEventSink != nil else { return }
+        if activity.activityState == .ended || activity.activityState == .dismissed {
+            handleActivityEnded(activityId: activity.id)
+            return
+        }
         monitorLiveActivity(activity)
         switch activity.activityState {
         case .active, .stale:
@@ -736,6 +754,14 @@ public class LiveActivitiesPlugin: NSObject, FlutterPlugin, FlutterStreamHandler
         default:
             break
         }
+    }
+
+    @MainActor private func handleActivityEnded(activityId: String) {
+        activityStateTasks.removeValue(forKey: activityId)?.cancel()
+        activityTokenTasks.removeValue(forKey: activityId)?.cancel()
+        Self.observedActivities.removeValue(forKey: activityId)
+        observedActivityTokens.removeValue(forKey: activityId)
+        activityEventSink?(["activityId": activityId, "status": "ended"])
     }
 
     @available(iOS 16.1, *)
@@ -761,6 +787,7 @@ public class LiveActivitiesPlugin: NSObject, FlutterPlugin, FlutterStreamHandler
 
     @MainActor private func emitActivityToken(_ data: Data, activityId: String) {
         guard !data.isEmpty else { return }
+        observedActivityTokens[activityId] = data
         let token = data.map { String(format: "%02x", $0) }.joined()
         activityEventSink?(["token": token, "activityId": activityId, "status": "active"])
     }
