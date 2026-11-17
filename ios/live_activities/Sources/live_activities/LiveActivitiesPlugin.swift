@@ -537,12 +537,19 @@ public class LiveActivitiesPlugin: NSObject, FlutterPlugin, FlutterStreamHandler
             defer {
                 if !Task.isCancelled { self?.pushToStartTokenTask = nil }
             }
+            if let data = Activity<LiveActivitiesAppAttributes>.pushToStartToken {
+                self?.emitPushToStartToken(data)
+            }
             for await data in Activity<LiveActivitiesAppAttributes>.pushToStartTokenUpdates {
                 guard let self, !Task.isCancelled else { return }
-                let token = data.map { String(format: "%02x", $0) }.joined()
-                self.pushToStartTokenEventSink?(token)
+                self.emitPushToStartToken(data)
             }
         }
+    }
+
+    @MainActor private func emitPushToStartToken(_ data: Data) {
+        guard !data.isEmpty else { return }
+        pushToStartTokenEventSink?(data.map { String(format: "%02x", $0) }.joined())
     }
 
     @MainActor private func stopObservingPushToStartTokens() {
