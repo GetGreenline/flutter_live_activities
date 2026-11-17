@@ -533,6 +533,8 @@ public class LiveActivitiesPlugin: NSObject, FlutterPlugin, FlutterStreamHandler
     
     @MainActor private func startObservingPushToStartTokens() {
         guard #available(iOS 17.2, *), pushToStartTokenTask == nil else { return }
+        NSLog("[LiveActivities] Push-to-start observer started; current token available: %@",
+              Activity<LiveActivitiesAppAttributes>.pushToStartToken == nil ? "no" : "yes")
         pushToStartTokenTask = Task { [weak self] in
             defer {
                 if !Task.isCancelled { self?.pushToStartTokenTask = nil }
@@ -549,6 +551,7 @@ public class LiveActivitiesPlugin: NSObject, FlutterPlugin, FlutterStreamHandler
 
     @MainActor private func emitPushToStartToken(_ data: Data) {
         guard !data.isEmpty else { return }
+        NSLog("[LiveActivities] Push-to-start token emitted to Flutter")
         pushToStartTokenEventSink?(data.map { String(format: "%02x", $0) }.joined())
     }
 
